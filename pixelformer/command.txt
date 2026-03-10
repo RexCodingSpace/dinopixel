@@ -1,0 +1,1 @@
+ python pixelformer/pixelformer_slam_v2.py     --checkpoint_path "/home/m2likai/Rex/pixel_pixel_unidepth_dinobase_SLAM/PixelFormer/models/pixelformer_dinov2_nyu/BR8_LR2-5_d1_val_0.97729_test_0.9650"     --video 78956958337__DB866C87-1ADD-4619-93CE-A22B7BD1F7EA.mov
