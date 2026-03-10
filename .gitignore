@@ -1,12 +1,12 @@
-# 1. 忽略所有檔案 (這行是核心)
+# 1. 先忽略所有東西
 *
 
-# 2. 解除忽略：允許這些資料夾
-!configs/
-!data_splits/
-!pixelformer/
+# 2. 允許特定的資料夾（包含所有子目錄與檔案）
+!configs/**
+!data_splits/**
+!pixelformer/**
 
-# 3. 解除忽略：允許這些檔案類型
+# 3. 允許根目錄下的特定檔案
 !*.py
 !*.txt
 !.gitignore
