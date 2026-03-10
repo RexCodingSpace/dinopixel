@@ -1,0 +1,13 @@
+# 1. 忽略所有檔案 (這行是核心)
+*
+
+# 2. 解除忽略：允許這些資料夾
+!configs/
+!data_splits/
+!pixelformer/
+
+# 3. 解除忽略：允許這些檔案類型
+!*.py
+!*.txt
+!.gitignore
+!README.md
