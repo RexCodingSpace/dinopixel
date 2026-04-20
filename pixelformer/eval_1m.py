@@ -56,15 +56,25 @@ elif args.dataset == 'kittipred':
     from dataloaders.dataloader_kittipred import NewDataLoader
 
 def eval(model, dataloader_eval, post_process=False):
-    eval_measures = torch.zeros(10).cuda()
+    # 初始化兩套指標：[0..8] 是指標，[9] 是計數器
+    eval_all = torch.zeros(10).cuda()
+    eval_1m = torch.zeros(10).cuda()
+
+    print("== Starting Evaluation (Global vs. <1m) ==")
+    a=0
     for _, eval_sample_batched in enumerate(tqdm(dataloader_eval.data)):
         with torch.no_grad():
             image = torch.autograd.Variable(eval_sample_batched['image'].cuda())
             gt_depth = eval_sample_batched['depth']
+            a=a+1
+            if a==1:
+                print(gt_depth.flatten()[153600:153700])
+            
             has_valid_depth = eval_sample_batched['has_valid_depth']
             if not has_valid_depth:
                 continue
 
+            # 模型推論
             pred_depth = model(image)
             if post_process:
                 image_flipped = flip_lr(image)
@@ -74,6 +84,7 @@ def eval(model, dataloader_eval, post_process=False):
             pred_depth = pred_depth.cpu().numpy().squeeze()
             gt_depth = gt_depth.cpu().numpy().squeeze()
 
+        # 1. 處理 KITTI Crop 邏輯 (與你原始流程一致)
         if args.do_kb_crop:
             height, width = gt_depth.shape
             top_margin = int(height - 352)
@@ -82,45 +93,62 @@ def eval(model, dataloader_eval, post_process=False):
             pred_depth_uncropped[top_margin:top_margin + 352, left_margin:left_margin + 1216] = pred_depth
             pred_depth = pred_depth_uncropped
 
+        # 2. 深度數值清理 (與你原始流程一致)
         pred_depth[pred_depth < args.min_depth_eval] = args.min_depth_eval
         pred_depth[pred_depth > args.max_depth_eval] = args.max_depth_eval
         pred_depth[np.isinf(pred_depth)] = args.max_depth_eval
         pred_depth[np.isnan(pred_depth)] = args.min_depth_eval
 
+        # 3. 建立有效遮罩 (包含 Eigen/Garg Crop)
         valid_mask = np.logical_and(gt_depth > args.min_depth_eval, gt_depth < args.max_depth_eval)
 
         if args.garg_crop or args.eigen_crop:
             gt_height, gt_width = gt_depth.shape
             eval_mask = np.zeros(valid_mask.shape)
-
             if args.garg_crop:
                 eval_mask[int(0.40810811 * gt_height):int(0.99189189 * gt_height), int(0.03594771 * gt_width):int(0.96405229 * gt_width)] = 1
-
             elif args.eigen_crop:
                 if args.dataset == 'kitti':
                     eval_mask[int(0.3324324 * gt_height):int(0.91351351 * gt_height), int(0.0359477 * gt_width):int(0.96405229 * gt_width)] = 1
                 elif args.dataset == 'nyu':
                     eval_mask[45:471, 41:601] = 1
-
             valid_mask = np.logical_and(valid_mask, eval_mask)
 
-        measures = compute_errors(gt_depth[valid_mask], pred_depth[valid_mask])
+        # --- A. 計算全域指標 (Overall) ---
+        measures_all = compute_errors(gt_depth[valid_mask], pred_depth[valid_mask])
+        eval_all[:9] += torch.tensor(measures_all).cuda()
+        eval_all[9] += 1
 
-        eval_measures[:9] += torch.tensor(measures).cuda()
-        eval_measures[9] += 1
+        # --- B. 計算 1m 內指標 (<1m Only) ---
+        mask_1m = np.logical_and(valid_mask, gt_depth <= 2)
+        if mask_1m.sum() > 50: # 確保至少有足夠像素才計算，避免單點雜訊
+            measures_1m = compute_errors(gt_depth[mask_1m], pred_depth[mask_1m])
+            eval_1m[:9] += torch.tensor(measures_1m).cuda()
+            eval_1m[9] += 1
 
-    eval_measures_cpu = eval_measures.cpu()
-    cnt = eval_measures_cpu[9].item()
-    eval_measures_cpu /= cnt
-    print('Computing errors for {} eval samples'.format(int(cnt)), ', post_process: ', post_process)
-    print("{:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}".format('silog', 'abs_rel', 'log10', 'rms',
-                                                                                'sq_rel', 'log_rms', 'd1', 'd2',
-                                                                                'd3'))
-    for i in range(8):
-        print('{:7.4f}, '.format(eval_measures_cpu[i]), end='')
-    print('{:7.4f}'.format(eval_measures_cpu[8]))
-    return eval_measures_cpu
+    # --- 最終數據處理與列印 ---
+    def print_result_table(title, results_tensor):
+        cnt = results_tensor[9].item()
+        if cnt == 0:
+            print(f"\n[{title}] No valid samples found.")
+            return
+        
+        final_metrics = results_tensor[:9].cpu() / cnt
+        print(f"\n[{title}] (Samples: {int(cnt)})")
+        header = "{:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}".format(
+            'silog', 'abs_rel', 'log10', 'rms', 'sq_rel', 'log_rms', 'd1', 'd2', 'd3'
+        )
+        print(header)
+        res_str = ", ".join(["{:7.4f}".format(final_metrics[i]) for i in range(9)])
+        print(res_str)
+        return final_metrics
 
+    # 印出全域結果
+    metrics_all = print_result_table("OVERALL PERFORMANCE", eval_all)
+    # 印出 1m 內結果
+    metrics_1m = print_result_table("NEAR-FIELD PERFORMANCE (< 1.0m)", eval_1m)
+
+    return eval_all.cpu() / eval_all[9].item()
 
 def main_worker(args):
     # 1. 初始化模型

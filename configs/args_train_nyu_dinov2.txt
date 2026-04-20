@@ -1,0 +1,39 @@
+--mode train
+--model_name pixelformer_dinov2_nyu
+--backbone_type dinov2
+--dinov2_model dinov2_vitb14
+--backbone_lr_factor 0.1
+--dataset nyu
+--data_path /home/m2likai/dataset_nyu_v2/sync/
+--gt_path /home/m2likai/dataset_nyu_v2/sync/
+--filenames_file data_splits/nyudepthv2_train_files_with_gt_dense.txt
+--batch_size 8
+--num_epochs 20
+--learning_rate 4e-5
+--weight_decay 1e-2
+--adam_eps 1e-6
+--num_threads 1
+--input_height 480
+--input_width 640
+--max_depth 10
+--do_random_rotate
+--degree 2.5
+--log_directory ./models/
+--dist_url tcp://127.0.0.1:2350
+
+--retrain
+--checkpoint_path ./models/pixelformer_dinov2_nyu/model-2000-best_d1_0.96076
+--teacher_path ./models/pixelformer_dinov2_nyu/thesis_test_gred_model-2000-best_d1_0.98006
+--teacher_model dinov2_vitl14
+--distill_weight 0.5
+
+--log_freq 100
+--do_online_eval
+--eval_freq 1000
+--data_path_eval /home/m2likai/workspace/dataset/nyu_depth_v2/official_splits/test/ 
+--gt_path_eval /home/m2likai/workspace/dataset/nyu_depth_v2/official_splits/test/ 
+--filenames_file_eval data_splits/nyudepthv2_test_files_with_gt.txt
+--min_depth_eval 1e-1
+--max_depth_eval 10
+--eigen_crop
+

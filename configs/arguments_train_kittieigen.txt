@@ -1,12 +1,13 @@
 --mode train
 --model_name pixelformer_kittieigen
---encoder large07
---pretrain pretrained/swin_large_patch4_window7_224_22k.pth
+--backbone_type dinov2
+--dinov2_model dinov2_vitl14
+--backbone_lr_factor 0.1
 --dataset kitti
---data_path dataset/KITTI
---gt_path dataset/kitti_gt
+--data_path /home/m2likai/workspace/dataset/kitti_dataset/
+--gt_path /home/m2likai/workspace/dataset/kitti_dataset/train/
 --filenames_file data_splits/eigen_train_files_with_gt.txt
---batch_size 8
+--batch_size 2
 --num_epochs 20
 --learning_rate 4e-5
 --weight_decay 1e-2
@@ -17,17 +18,20 @@
 --max_depth 80
 --do_kb_crop
 --do_random_rotate
---degree 1.0
+--degree 2.5
 --log_directory ./models/
 --multiprocessing_distributed
 --dist_url tcp://127.0.0.1:1234
 
+--retrain
+--checkpoint_path ./models/pixelformer_dinov2_nyu/valid_model-2000-best_d1_0.98034
+
 --log_freq 100
 --do_online_eval
 --eval_freq 1000
---data_path_eval dataset/KITTI
---gt_path_eval kitti_gt
+--data_path_eval /home/m2likai/workspace/dataset/kitti_dataset/
+--gt_path_eval /home/m2likai/workspace/dataset/kitti_dataset/val/
 --filenames_file_eval data_splits/eigen_test_files_with_gt.txt
---min_depth_eval 1e-3
+--min_depth_eval 1e-1
 --max_depth_eval 80
---garg_crop
+--eigen_crop

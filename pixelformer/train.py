@@ -4,6 +4,7 @@ import torch.nn.utils as utils
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 
 import os, sys, time
 from telnetlib import IP
@@ -13,11 +14,86 @@ from tqdm import tqdm
 
 from tensorboardX import SummaryWriter
 
-from utils import post_process_depth, flip_lr, silog_loss, compute_errors, eval_metrics, \
+from utils import post_process_depth, flip_lr, compute_errors, eval_metrics, \
                        block_print, enable_print, normalize_result, inv_normalize, convert_arg_line_to_args
-from networks.PixelFormer import PixelFormer
+from networks.PixelFormer import MambaPixelFormer
+
+# ===================================================================
+# Gloo allreduce (for online eval under NCCL backend)
+# ===================================================================
+_gloo_group = None
+def _get_gloo_group():
+    global _gloo_group
+    if _gloo_group is None:
+        _gloo_group = dist.new_group(backend="gloo")
+    return _gloo_group
+
+def _allreduce_small_cpu_sum(x_cpu: torch.Tensor):
+    if not dist.is_initialized():
+        return x_cpu
+    backend = dist.get_backend()
+    if backend == "nccl":
+        g = _get_gloo_group()
+        dist.all_reduce(x_cpu, op=dist.ReduceOp.SUM, group=g)
+    else:
+        dist.all_reduce(x_cpu, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+    return x_cpu
+
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+# ===================================================================
+# Safe SILog Loss — 防 NaN 版本
+# ===================================================================
+# 把原本的 SafeSILogLoss 替換成這個
+class SafeSILogLoss(nn.Module):
+    def __init__(self, variance_focus=0.85, grad_weight=0.5):
+        super().__init__()
+        self.variance_focus = variance_focus
+        self.grad_weight = grad_weight
+
+    def silog(self, pred, target, mask):
+        if mask.sum() < 10:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        pred_safe = pred[mask].clamp(min=1e-3)
+        target_safe = target[mask].clamp(min=1e-3)
+        err = torch.log(pred_safe) - torch.log(target_safe)
+        variance = (err ** 2).mean() - self.variance_focus * (err.mean() ** 2)
+        return torch.sqrt(torch.clamp(variance, min=1e-4))
+
+    def gradient_loss(self, pred, target, mask):
+        log_p = torch.log(pred.clamp(min=1e-3))
+        log_t = torch.log(target.clamp(min=1e-3))
+
+        # x 和 y 方向的梯度
+        pred_gx = log_p[:, :, :, 1:] - log_p[:, :, :, :-1]
+        pred_gy = log_p[:, :, 1:, :] - log_p[:, :, :-1, :]
+        gt_gx = log_t[:, :, :, 1:] - log_t[:, :, :, :-1]
+        gt_gy = log_t[:, :, 1:, :] - log_t[:, :, :-1, :]
+
+        mask_x = mask[:, :, :, 1:] & mask[:, :, :, :-1]
+        mask_y = mask[:, :, 1:, :] & mask[:, :, :-1, :]
+
+        if mask_x.sum() < 10 or mask_y.sum() < 10:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+
+        loss_x = torch.abs(pred_gx - gt_gx)[mask_x].mean()
+        loss_y = torch.abs(pred_gy - gt_gy)[mask_y].mean()
+        return loss_x + loss_y
+
+    def forward(self, pred, target, mask):
+        s_loss = self.silog(pred, target, mask)
+        g_loss = self.gradient_loss(pred, target, mask)
+        #return s_loss + self.grad_weight * g_loss
+        return s_loss
 
 
+# ===================================================================
+# Argument Parser
+# ===================================================================
 parser = argparse.ArgumentParser(description='PixelFormer PyTorch implementation.', fromfile_prefix_chars='@')
 parser.convert_arg_line_to_args = convert_arg_line_to_args
 
@@ -25,6 +101,11 @@ parser.add_argument('--mode',                      type=str,   help='train or te
 parser.add_argument('--model_name',                type=str,   help='model name', default='pixelformer')
 parser.add_argument('--encoder',                   type=str,   help='type of encoder, base07, large07', default='large07')
 parser.add_argument('--pretrain',                  type=str,   help='path of pretrained encoder', default=None)
+
+# ===== DINOv2 =====
+parser.add_argument('--backbone_type',             type=str,   help='backbone type: swin or dinov2', default='swin')
+parser.add_argument('--dinov2_model',              type=str,   help='dinov2 model: dinov2_vits14, dinov2_vitb14, dinov2_vitl14', default='dinov2_vitl14')
+parser.add_argument('--freeze_backbone',           action='store_true', help='freeze backbone weights')
 
 # Dataset
 parser.add_argument('--dataset',                   type=str,   help='dataset to train on, kitti or nyu', default='nyu')
@@ -51,6 +132,9 @@ parser.add_argument('--learning_rate',             type=float, help='initial lea
 parser.add_argument('--end_learning_rate',         type=float, help='end learning rate', default=-1)
 parser.add_argument('--variance_focus',            type=float, help='lambda in paper: [0, 1], higher value more focus on minimizing variance of error', default=0.85)
 
+# backbone lr
+parser.add_argument('--backbone_lr_factor',        type=float, help='backbone learning rate = lr * factor', default=0.1)
+
 # Preprocessing
 parser.add_argument('--do_random_rotate',                      help='if set, will perform random rotation for augmentation', action='store_true')
 parser.add_argument('--degree',                    type=float, help='random rotation maximum degree', default=2.5)
@@ -73,8 +157,8 @@ parser.add_argument('--do_online_eval',                        help='if set, per
 parser.add_argument('--data_path_eval',            type=str,   help='path to the data for online evaluation', required=False)
 parser.add_argument('--gt_path_eval',              type=str,   help='path to the groundtruth data for online evaluation', required=False)
 parser.add_argument('--filenames_file_eval',       type=str,   help='path to the filenames text file for online evaluation', required=False)
-parser.add_argument('--min_depth_eval',            type=float, help='minimum depth for evaluation', default=1e-3)
-parser.add_argument('--max_depth_eval',            type=float, help='maximum depth for evaluation', default=80)
+parser.add_argument('--min_depth_eval',            type=float, help='minimum depth for evaluation', default=1e-1)
+parser.add_argument('--max_depth_eval',            type=float, help='maximum depth for evaluation', default=10.0)
 parser.add_argument('--eigen_crop',                            help='if set, crops according to Eigen NIPS14', action='store_true')
 parser.add_argument('--garg_crop',                             help='if set, crops according to Garg  ECCV16', action='store_true')
 parser.add_argument('--eval_freq',                 type=int,   help='Online evaluation frequency in global steps', default=500)
@@ -93,6 +177,9 @@ elif args.dataset == 'kittipred':
     from dataloaders.dataloader_kittipred import NewDataLoader
 
 
+# ===================================================================
+# Online Evaluation
+# ===================================================================
 def online_eval(model, dataloader_eval, gpu, ngpus, post_process=False):
     eval_measures = torch.zeros(10).cuda(device=gpu)
     for _, eval_sample_batched in enumerate(tqdm(dataloader_eval.data)):
@@ -101,13 +188,21 @@ def online_eval(model, dataloader_eval, gpu, ngpus, post_process=False):
             gt_depth = eval_sample_batched['depth']
             has_valid_depth = eval_sample_batched['has_valid_depth']
             if not has_valid_depth:
-                # print('Invalid depth. continue.')
                 continue
 
-            pred_depth = model(image)
+            output = model(image)
+            if isinstance(output, dict):
+                pred_depth = output['final']
+            else:
+                pred_depth = output
+
             if post_process:
                 image_flipped = flip_lr(image)
-                pred_depth_flipped = model(image_flipped)
+                output_flipped = model(image_flipped)
+                if isinstance(output_flipped, dict):
+                    pred_depth_flipped = output_flipped['final']
+                else:
+                    pred_depth_flipped = output_flipped
                 pred_depth = post_process_depth(pred_depth, pred_depth_flipped)
 
             pred_depth = pred_depth.cpu().numpy().squeeze()
@@ -133,11 +228,12 @@ def online_eval(model, dataloader_eval, gpu, ngpus, post_process=False):
             eval_mask = np.zeros(valid_mask.shape)
 
             if args.garg_crop:
-                eval_mask[int(0.40810811 * gt_height):int(0.99189189 * gt_height), int(0.03594771 * gt_width):int(0.96405229 * gt_width)] = 1
-
+                eval_mask[int(0.40810811 * gt_height):int(0.99189189 * gt_height),
+                          int(0.03594771 * gt_width):int(0.96405229 * gt_width)] = 1
             elif args.eigen_crop:
                 if args.dataset == 'kitti':
-                    eval_mask[int(0.3324324 * gt_height):int(0.91351351 * gt_height), int(0.0359477 * gt_width):int(0.96405229 * gt_width)] = 1
+                    eval_mask[int(0.3324324 * gt_height):int(0.91351351 * gt_height),
+                              int(0.0359477 * gt_width):int(0.96405229 * gt_width)] = 1
                 elif args.dataset == 'nyu':
                     eval_mask[45:471, 41:601] = 1
 
@@ -149,17 +245,17 @@ def online_eval(model, dataloader_eval, gpu, ngpus, post_process=False):
         eval_measures[9] += 1
 
     if args.multiprocessing_distributed:
-        group = dist.new_group([i for i in range(ngpus)])
-        dist.all_reduce(tensor=eval_measures, op=dist.ReduceOp.SUM, group=group)
+        eval_measures_cpu = eval_measures.detach().to(torch.float32).cpu()
+        eval_measures_cpu = _allreduce_small_cpu_sum(eval_measures_cpu)
+    else:
+        eval_measures_cpu = eval_measures.cpu()
 
     if not args.multiprocessing_distributed or gpu == 0:
-        eval_measures_cpu = eval_measures.cpu()
         cnt = eval_measures_cpu[9].item()
         eval_measures_cpu /= cnt
         print('Computing errors for {} eval samples'.format(int(cnt)), ', post_process: ', post_process)
-        print("{:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}".format('silog', 'abs_rel', 'log10', 'rms',
-                                                                                     'sq_rel', 'log_rms', 'd1', 'd2',
-                                                                                     'd3'))
+        print("{:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}".format(
+            'silog', 'abs_rel', 'log10', 'rms', 'sq_rel', 'log_rms', 'd1', 'd2', 'd3'))
         for i in range(8):
             print('{:7.4f}, '.format(eval_measures_cpu[i]), end='')
         print('{:7.4f}'.format(eval_measures_cpu[8]))
@@ -167,8 +263,11 @@ def online_eval(model, dataloader_eval, gpu, ngpus, post_process=False):
 
     return None
 
-
+# ===================================================================
+# Main Worker
+# ===================================================================
 def main_worker(gpu, ngpus_per_node, args):
+    set_seed(42)
     args.gpu = gpu
 
     if args.gpu is not None:
@@ -179,9 +278,30 @@ def main_worker(gpu, ngpus_per_node, args):
             args.rank = int(os.environ["RANK"])
         if args.multiprocessing_distributed:
             args.rank = args.rank * ngpus_per_node + gpu
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=args.world_size, rank=args.rank)
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
 
-    model = PixelFormer(version=args.encoder, inv_depth=False, max_depth=args.max_depth, pretrained=args.pretrain)
+    # ===================================================================
+    # 建立模型
+    # ===================================================================
+    if args.backbone_type == "dinov2":
+        print(f"== Using DINOv2 backbone: {args.dinov2_model}")
+        model = MambaPixelFormer(
+            dinov2_model=args.dinov2_model,
+            freeze_backbone=args.freeze_backbone,
+            min_depth=0.1,
+            max_depth=args.max_depth,
+        )
+    else:
+        print(f"== Using Swin backbone: {args.encoder}")
+        model = MambaPixelFormer(
+            backbone_type="swin",
+            version=args.encoder,
+            inv_depth=False,
+            max_depth=args.max_depth,
+            pretrained=args.pretrain
+        )
+
     model.train()
 
     num_params = sum([np.prod(p.size()) for p in model.parameters()])
@@ -213,9 +333,29 @@ def main_worker(gpu, ngpus_per_node, args):
     best_eval_measures_higher_better = torch.zeros(3).cpu()
     best_eval_steps = np.zeros(9, dtype=np.int32)
 
-    # Training parameters
-    optimizer = torch.optim.Adam([{'params': model.module.parameters()}],
-                                lr=args.learning_rate)
+    # ===================================================================
+    # Optimizer
+    # ===================================================================
+    if args.backbone_type == "dinov2":
+        backbone_params = []
+        other_params = []
+        for name, param in model.module.named_parameters():
+            if 'backbone' in name:
+                backbone_params.append(param)
+            else:
+                other_params.append(param)
+
+        optimizer = torch.optim.AdamW([
+            {'params': backbone_params, 'lr': args.learning_rate * args.backbone_lr_factor},
+            {'params': other_params, 'lr': args.learning_rate}
+        ], weight_decay=args.weight_decay, eps=args.adam_eps)
+
+        print(f"== Optimizer: backbone lr = {args.learning_rate * args.backbone_lr_factor:.2e}, "
+              f"other lr = {args.learning_rate:.2e}")
+    else:
+        optimizer = torch.optim.Adam([{'params': model.module.parameters()}],
+                                     lr=args.learning_rate,
+                                     eps=args.adam_eps)
 
     model_just_loaded = False
     if args.checkpoint_path != '':
@@ -226,10 +366,30 @@ def main_worker(gpu, ngpus_per_node, args):
             else:
                 loc = 'cuda:{}'.format(args.gpu)
                 checkpoint = torch.load(args.checkpoint_path, map_location=loc)
-            model.load_state_dict(checkpoint['model'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-
-            print("== Loaded checkpoint '{}' (global_step {})".format(args.checkpoint_path, checkpoint['global_step']))
+            
+            missing, unexpected = model.load_state_dict(checkpoint['model'], strict=False)
+            if missing:
+                print(f"== Missing keys (will train from scratch): {missing}")
+            if unexpected:
+                print(f"== Unexpected keys (ignored): {unexpected}")
+            
+            if not args.retrain:
+                # 正常續練：載入 optimizer 和 global_step
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    print("== Loaded optimizer state")
+                except (ValueError, KeyError) as e:
+                    print(f"== Skipped loading optimizer ({e})")
+                try:
+                    global_step = checkpoint['global_step']
+                except KeyError:
+                    global_step = 0
+            else:
+                # retrain：只要權重，optimizer 重來、step 歸零
+                print("== Retrain mode: skipping optimizer, global_step reset to 0")
+                global_step = 0
+            
+            print("== Loaded checkpoint '{}' (global_step {})".format(args.checkpoint_path, global_step))
         else:
             print("== No checkpoint found at '{}'".format(args.checkpoint_path))
         model_just_loaded = True
@@ -239,11 +399,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     dataloader = NewDataLoader(args, 'train')
     dataloader_eval = NewDataLoader(args, 'online_eval')
-
-    # ===== Evaluation before training ======
-    # model.eval()
-    # with torch.no_grad():
-    #     eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node, post_process=True)
 
     # Logging
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
@@ -255,7 +410,10 @@ def main_worker(gpu, ngpus_per_node, args):
                 eval_summary_path = os.path.join(args.log_directory, args.model_name, 'eval')
             eval_summary_writer = SummaryWriter(eval_summary_path, flush_secs=30)
 
-    silog_criterion = silog_loss(variance_focus=args.variance_focus)
+    # ===================================================================
+    # 使用 SafeSILogLoss 取代原本的 silog_loss
+    # ===================================================================
+    silog_criterion = SafeSILogLoss(variance_focus=args.variance_focus, grad_weight=0.5)
 
     start_time = time.time()
     duration = 0
@@ -267,7 +425,7 @@ def main_worker(gpu, ngpus_per_node, args):
     var_cnt = len(var_sum)
     var_sum = np.sum(var_sum)
 
-    print("== Initial variables' sum: {:.3f}, avg: {:.3f}".format(var_sum, var_sum/var_cnt))
+    print("== Initial variables' sum: {:.3f}, avg: {:.3f}".format(var_sum, var_sum / var_cnt))
 
     steps_per_epoch = len(dataloader.data)
     num_total_steps = args.num_epochs * steps_per_epoch
@@ -286,21 +444,41 @@ def main_worker(gpu, ngpus_per_node, args):
 
             depth_est = model(image)
 
+            # --- Mask ---
             if args.dataset == 'nyu':
-                mask = depth_gt > 0.1
+                mask = (depth_gt > 0.1) & (depth_gt < args.max_depth)
             else:
                 mask = depth_gt > 1.0
+            mask = mask.to(torch.bool)
 
-            loss = silog_criterion.forward(depth_est, depth_gt, mask.to(torch.bool))
+            if isinstance(depth_est, dict):
+                pred_final = depth_est['final'].clamp(min=1e-3, max=args.max_depth)
+                loss = silog_criterion(pred_final, depth_gt, mask)
+            else:
+                depth_est_safe = depth_est.clamp(min=1e-3, max=args.max_depth)
+                loss = silog_criterion(depth_est_safe, depth_gt, mask)
+
+            # --- Backward + Gradient Clipping ---
             loss.backward()
-            for param_group in optimizer.param_groups:
-                current_lr = (args.learning_rate - end_learning_rate) * (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # 更新學習率
+            for i, param_group in enumerate(optimizer.param_groups):
+                if args.backbone_type == "dinov2":
+                    if i == 0:  # backbone
+                        base_lr = args.learning_rate * args.backbone_lr_factor
+                    else:  # other
+                        base_lr = args.learning_rate
+                    current_lr = (base_lr - base_lr * 0.1) * (1 - global_step / num_total_steps) ** 0.9 + base_lr * 0.1
+                else:
+                    current_lr = (args.learning_rate - end_learning_rate) * (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate
                 param_group['lr'] = current_lr
 
             optimizer.step()
 
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
-                print('[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], lr: {:.12f}, loss: {:.12f}'.format(epoch, step, steps_per_epoch, global_step, current_lr, loss))
+                print('[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], lr: {:.12f}, loss: {:.12f}'.format(
+                    epoch, step, steps_per_epoch, global_step, current_lr, loss))
                 if np.isnan(loss.cpu().item()):
                     print('NaN in loss occurred. Aborting training.')
                     return -1
@@ -317,18 +495,29 @@ def main_worker(gpu, ngpus_per_node, args):
                 if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
                     print("{}".format(args.model_name))
                 print_string = 'GPU: {} | examples/s: {:4.2f} | loss: {:.5f} | var sum: {:.3f} avg: {:.3f} | time elapsed: {:.2f}h | time left: {:.2f}h'
-                print(print_string.format(args.gpu, examples_per_sec, loss, var_sum.item(), var_sum.item()/var_cnt, time_sofar, training_time_left))
+                print(print_string.format(args.gpu, examples_per_sec, loss, var_sum.item(), var_sum.item() / var_cnt,
+                                          time_sofar, training_time_left))
 
                 if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                             and args.rank % ngpus_per_node == 0):
                     writer.add_scalar('silog_loss', loss, global_step)
                     writer.add_scalar('learning_rate', current_lr, global_step)
-                    writer.add_scalar('var average', var_sum.item()/var_cnt, global_step)
-                    depth_gt = torch.where(depth_gt < 1e-3, depth_gt * 0 + 1e3, depth_gt)
+                    writer.add_scalar('var average', var_sum.item() / var_cnt, global_step)
+                    depth_gt_vis = torch.where(depth_gt < 1e-3, depth_gt * 0 + 1e3, depth_gt)
+
+                    # 取得用於 TensorBoard 的 depth_est tensor
+                    if isinstance(depth_est, dict):
+                        depth_est_vis = depth_est['final']
+                    else:
+                        depth_est_vis = depth_est
+
                     for i in range(num_log_images):
-                        writer.add_image('depth_gt/image/{}'.format(i), normalize_result(1/depth_gt[i, :, :, :].data), global_step)
-                        writer.add_image('depth_est/image/{}'.format(i), normalize_result(1/depth_est[i, :, :, :].data), global_step)
-                        writer.add_image('image/image/{}'.format(i), inv_normalize(image[i, :, :, :]).data, global_step)
+                        writer.add_image('depth_gt/image/{}'.format(i),
+                                         normalize_result(1 / depth_gt_vis[i, :, :, :].data), global_step)
+                        writer.add_image('depth_est/image/{}'.format(i),
+                                         normalize_result(1 / depth_est_vis[i, :, :, :].data), global_step)
+                        writer.add_image('image/image/{}'.format(i),
+                                         inv_normalize(image[i, :, :, :]).data, global_step)
                     writer.flush()
 
             if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded:
@@ -345,11 +534,11 @@ def main_worker(gpu, ngpus_per_node, args):
                             old_best = best_eval_measures_lower_better[i].item()
                             best_eval_measures_lower_better[i] = measure.item()
                             is_best = True
-                        elif i >= 6 and measure > best_eval_measures_higher_better[i-6]:
-                            old_best = best_eval_measures_higher_better[i-6].item()
-                            best_eval_measures_higher_better[i-6] = measure.item()
+                        elif i >= 6 and measure > best_eval_measures_higher_better[i - 6]:
+                            old_best = best_eval_measures_higher_better[i - 6].item()
+                            best_eval_measures_higher_better[i - 6] = measure.item()
                             is_best = True
-                        if is_best:
+                        if is_best and (eval_metrics[i] in ['silog', 'abs_rel', 'd1']):
                             old_best_step = best_eval_steps[i]
                             old_best_name = '/model-{}-best_{}_{:.5f}'.format(old_best_step, eval_metrics[i], old_best)
                             model_path = args.log_directory + '/' + args.model_name + old_best_name
@@ -359,7 +548,9 @@ def main_worker(gpu, ngpus_per_node, args):
                             best_eval_steps[i] = global_step
                             model_save_name = '/model-{}-best_{}_{:.5f}'.format(global_step, eval_metrics[i], measure)
                             print('New best for {}. Saving model: {}'.format(eval_metrics[i], model_save_name))
-                            checkpoint = {'model': model.state_dict()}
+                            checkpoint = {'model': model.state_dict(),
+                                          'optimizer': optimizer.state_dict(),
+                                          'global_step': global_step}
                             torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
                     eval_summary_writer.flush()
                 model.train()
@@ -370,7 +561,7 @@ def main_worker(gpu, ngpus_per_node, args):
             global_step += 1
 
         epoch += 1
-       
+
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
         writer.close()
         if args.do_online_eval:
@@ -406,7 +597,7 @@ def main():
 
     ngpus_per_node = torch.cuda.device_count()
     if ngpus_per_node > 1 and not args.multiprocessing_distributed:
-        print("This machine has more than 1 gpu. Please specify --multiprocessing_distributed, or set \'CUDA_VISIBLE_DEVICES=0\'")
+        print("This machine has more than 1 gpu. Please specify --multiprocessing_distributed, or set 'CUDA_VISIBLE_DEVICES=0'")
         return -1
 
     if args.do_online_eval:

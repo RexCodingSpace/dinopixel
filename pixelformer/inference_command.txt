@@ -1,0 +1,2 @@
+python pixelformer/thesis_inference.py --checkpoint_path ./models/pixelformer_dinov2_nyu/thesis_test_gred_model-2000-best_d1_0.98006 --input /home/m2likai/workspace/dataset/nyu_depth_v2/official_splits/test/study_room/rgb_00278.jpg --output ./result1
+python pixelformer/thesis_inference.py --checkpoint_path ./models/pixelformer_dinov2_nyu/thesis_test_gred_model-2000-best_d1_0.98006 --input /home/m2likai/workspace/dataset/nyu_depth_v2/official_splits/test/playroom/rgb_00431.jpg --output ./result2

@@ -1,0 +1,9 @@
+# 建 strict FP32 engine + 驗證 + benchmark
+python trt_build_strict_fp32.py \
+    --onnx mamba_pixelformer_sim.onnx \
+    --engine mamba_strict_fp32.engine
+
+# 已有 engine,只跑驗證和 benchmark
+python trt_build_strict_fp32.py \
+    --skip_build \
+    --engine mamba_strict_fp32.engine

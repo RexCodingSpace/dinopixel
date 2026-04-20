@@ -1,1 +1,10 @@
+/*
+!/configs/
+!/data_splits/
+!/pixelformer/
+!.gitignore
+!README.md
+*.engine
 *.pth
+*.onnx
+__pycache__/
