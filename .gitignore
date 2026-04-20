@@ -4,6 +4,7 @@
 !/pixelformer/
 !.gitignore
 !README.md
+*.whl
 *.engine
 *.pth
 *.onnx

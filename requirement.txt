@@ -1,0 +1,35 @@
+# ============================================
+# Jetson Orin Depth Estimation Dependencies
+# Run with: pip install -r requirements.txt \
+#     --extra-index-url https://pypi.jetson-ai-lab.dev/jp6/cu122
+# ============================================
+# Note: PyTorch 2.3.0 must be installed separately (see install_jetson.sh)
+
+# Vision & Runtime (from Jetson AI Lab index)
+torchvision
+onnxruntime-gpu==1.18.0
+
+# TensorRT Python bindings
+tensorrt==10.7.0
+
+# ONNX toolchain
+onnx==1.21.0
+onnxsim==0.6.2
+onnx-graphsurgeon==0.3.12
+
+# Core numerical
+numpy==1.26.4
+scipy==1.15.3
+protobuf==7.34.1
+
+# Image / IO
+pillow==12.2.0
+opencv-python-headless==4.13.0.92
+h5py==3.16.0
+
+# Utilities
+tqdm==4.67.3
+pyyaml
+flatbuffers==25.12.19
+coloredlogs==15.0.1
+sympy==1.14.0

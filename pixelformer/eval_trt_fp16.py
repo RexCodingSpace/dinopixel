@@ -13,17 +13,18 @@ from dataloaders.dataloader import NewDataLoader
 
 TRT_LOGGER = trt.Logger(trt.Logger.INFO)
 
+
 def convert_arg_line_to_args(arg_line):
     for arg in arg_line.split():
         if not arg.strip(): continue
         yield arg
 
+
 def get_args():
-    parser = argparse.ArgumentParser(description='PixelFormer TRT 8.6 Eval', fromfile_prefix_chars='@')
+    parser = argparse.ArgumentParser(description='PixelFormer TRT 10.x Eval', fromfile_prefix_chars='@')
     parser.convert_arg_line_to_args = convert_arg_line_to_args
-    
-    # 預設指向你在 8.6.1 建好的 engine
-    parser.add_argument('--engine', type=str, default="mamba_trt8.engine", help='TRT 8.6 engine path')
+
+    parser.add_argument('--engine', type=str, default="mamba_trt8.engine", help='TRT engine path')
     parser.add_argument('--dataset', type=str, default='nyu')
     parser.add_argument('--input_height', type=int, default=480)
     parser.add_argument('--input_width', type=int, default=640)
@@ -35,7 +36,7 @@ def get_args():
     parser.add_argument('--do_kb_crop', action='store_true')
     parser.add_argument('--eigen_crop', action='store_true')
     parser.add_argument('--garg_crop', action='store_true')
-    
+
     # DataLoader 相容參數
     parser.add_argument('--do_random_rotate', action='store_true')
     parser.add_argument('--degree', type=float, default=2.5)
@@ -48,93 +49,94 @@ def get_args():
         args, unknown = parser.parse_known_args()
     return args
 
+
 class TensorRTInference:
+    """TensorRT 10.x 相容版本"""
     def __init__(self, engine_path):
         runtime = trt.Runtime(TRT_LOGGER)
         with open(engine_path, "rb") as f:
             self.engine = runtime.deserialize_cuda_engine(f.read())
-        
+
         if self.engine is None:
-            raise RuntimeError(f"Failed to load engine: {engine_path}. Please check TRT version compatibility.")
-            
+            raise RuntimeError(f"Failed to load engine: {engine_path}. Check TRT version compatibility.")
+
         self.context = self.engine.create_execution_context()
         self.stream = torch.cuda.Stream()
-        
-        # --- TRT 8.6 核心改動：使用 Binding 邏輯 ---
-        self.bindings = [None] * self.engine.num_bindings
-        self.buffers = {}
-        self.input_idx = -1
-        self.output_name = None
 
-        print("== [Inference Info] Binding Tensors (TRT 8.6 Style):")
-        for i in range(self.engine.num_bindings):
-            name = self.engine.get_binding_name(i)
-            shape = tuple(self.engine.get_binding_shape(i))
-            dtype = trt.nptype(self.engine.get_binding_dtype(i))
-            
-            if self.engine.binding_is_input(i):
-                self.input_idx = i
-                print(f"   [Input]  {name}: shape={shape}")
+        # --- TRT 10.x: 使用 num_io_tensors / get_tensor_* API ---
+        self.input_name = None
+        self.output_name = None
+        self.output_shape = None
+
+        print("== [Inference Info] Binding Tensors (TRT 10.x):")
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            mode = self.engine.get_tensor_mode(name)
+            shape = tuple(self.engine.get_tensor_shape(name))
+            dtype = self.engine.get_tensor_dtype(name)
+
+            if mode == trt.TensorIOMode.INPUT:
+                self.input_name = name
+                print(f"   [Input]  {name}: shape={shape}, dtype={dtype}")
             else:
-                # 建立輸出 Buffer
                 self.output_name = name
-                out_tensor = torch.empty(shape, dtype=torch.float32, device='cuda')
-                self.buffers[name] = out_tensor
-                self.bindings[i] = out_tensor.data_ptr()
-                print(f"   [Output] {name}: shape={shape}")
+                self.output_shape = shape
+                print(f"   [Output] {name}: shape={shape}, dtype={dtype}")
+
+        # 預先分配 output buffer (重複使用,避免每次 run 都重新 malloc)
+        self.output_tensor = torch.empty(self.output_shape, dtype=torch.float32, device='cuda')
 
     def run(self, image_tensor):
-        # 確保輸入連續並綁定地址
+        """image_tensor: [1, 3, H, W] on GPU"""
         image_tensor = image_tensor.contiguous()
-        self.bindings[self.input_idx] = image_tensor.data_ptr()
-        
-        # 執行推論 (TRT 8.6 使用 execute_async_v2)
-        self.context.execute_async_v2(
-            bindings=self.bindings,
-            stream_handle=self.stream.cuda_stream
-        )
+
+        # TRT 10.x: set_tensor_address + execute_async_v3
+        self.context.set_tensor_address(self.input_name, image_tensor.data_ptr())
+        self.context.set_tensor_address(self.output_name, self.output_tensor.data_ptr())
+
+        self.context.execute_async_v3(self.stream.cuda_stream)
         self.stream.synchronize()
-        
-        # 抓取最終深度圖
-        return self.buffers[self.output_name]
+
+        return self.output_tensor
+
 
 def main():
     args = get_args()
     args.distributed = False
     args.world_size = 1
     args.rank = 0
-    
+
     # 1. 準備數據與模型
     dataloader = NewDataLoader(args, 'online_eval')
     model = TensorRTInference(args.engine)
-    
+
     eval_measures = torch.zeros(10).cuda()
-    
+
     print(f"\n== [Start] Running Evaluation: {args.engine}")
     start_time = time.time()
 
     # 2. 評估迴圈
     for i, sample in enumerate(tqdm(dataloader.data)):
         with torch.no_grad():
-            img = sample['image'].cuda() 
+            img = sample['image'].cuda()
             gt_depth = sample['depth'].squeeze().numpy()
             if not sample['has_valid_depth']: continue
 
             # 對齊 Engine 靜態輸入 (480x640)
             if img.shape[2:] != (args.input_height, args.input_width):
-                img_input = F.interpolate(img, size=(args.input_height, args.input_width), 
-                                         mode='bilinear', align_corners=True)
+                img_input = F.interpolate(img, size=(args.input_height, args.input_width),
+                                          mode='bilinear', align_corners=True)
             else:
                 img_input = img
 
             # 3. 推論
             pred_trt = model.run(img_input)
-            
+
             # Resize 回原圖大小算誤差
             if pred_trt.shape[-2:] != gt_depth.shape:
-                pred_trt = F.interpolate(pred_trt, size=gt_depth.shape, 
-                                        mode='bilinear', align_corners=True)
-            
+                pred_trt = F.interpolate(pred_trt, size=gt_depth.shape,
+                                         mode='bilinear', align_corners=True)
+
             pred_depth = pred_trt.cpu().numpy().squeeze()
 
             # 4. 後處理 (Clip & Crop)
@@ -173,15 +175,16 @@ def main():
         return
 
     final_res = (eval_measures[:9] / cnt).cpu().numpy()
-    
+
     print("\n" + "="*70)
-    print(f"Results for TensorRT 8.6.1 Engine")
+    print(f"Results for TensorRT 10.x Engine on Jetson Orin")
     print(f"Total Images: {int(cnt)} | Avg FPS: {cnt / total_time:.2f}")
     print("-" * 70)
     print("{:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}".format(
         'silog', 'abs_rel', 'log10', 'rms', 'sq_rel', 'log_rms', 'd1', 'd2', 'd3'))
     print(", ".join([f"{x:7.4f}" for x in final_res]))
     print("="*70)
+
 
 if __name__ == '__main__':
     main()
